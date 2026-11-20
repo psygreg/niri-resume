@@ -1,0 +1,16 @@
+[package]
+name = "niri-resume"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.75"
+description = "Session save & restore for the niri Wayland compositor: records which apps were running at end of session and relaunches them at startup."
+license = "GPL-3.0-or-later"
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+[profile.release]
+lto = true
+codegen-units = 1
+strip = true

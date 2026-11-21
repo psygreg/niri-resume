@@ -3,9 +3,11 @@
 Resume your previous session after rebooting or shutting down on niri.
 
 `niri-resume` is a small Rust CLI that records which apps were running when a
-niri session ended, and relaunches them at the next startup. It has no GUI and
-no interactivity: niri launches it, it does its job in a few milliseconds, and
-it exits.
+niri session ended — including each window's workspace, size, maximized/
+fullscreen state and position — and relaunches and re-places them at the next
+startup. It has no GUI and no interactivity: niri launches it, it does its job
+in a few milliseconds (plus a bounded wait while windows reappear), and it
+exits.
 
 ## How it works
 
@@ -22,7 +24,9 @@ it trigger the session-ending action (quit niri, `systemctl poweroff`, or
 **Startup** (`restore`, from `spawn-at-startup`): the tool reads the snapshot
 and launches each recorded app with its exact original command line and working
 directory. If a recorded binary has since moved or disappeared, it falls back
-to the app's desktop entry `Exec` command.
+to the app's desktop entry `Exec` command. It then watches the compositor for
+the freshly opened windows, matches them against the recorded ones, and
+re-places each one (see the next section).
 
 ### What counts as an "app"
 
@@ -37,6 +41,40 @@ Window → process mapping uses the PID that niri reports for each window
 `/proc/<pid>` for the executable, argv and working directory, and matches
 desktop entries (by desktop id, `StartupWMClass`, or `Exec` binary name) for
 names and fallback launch commands.
+
+### Window layout restore
+
+For every window the snapshot records:
+
+- the **workspace** (by name for named workspaces, otherwise by 1-based index
+  and output),
+- the **tile size** in logical pixels,
+- the **state**: normal, maximized or fullscreen,
+- the **position** for floating windows (niri reports floating windows'
+  absolute positions; `niri-ipc` does not expose them for tiled ones),
+- the **column arrangement** for tiled windows (1-based column index and
+  tile-within-column index),
+- which window was **focused**.
+
+At restore, each spawned app's new windows are matched to the recorded ones
+(process-descendant PIDs first, then app-id with a title tiebreak) and placed
+via niri IPC actions: `move-window-to-workspace` / `move-window-to-monitor`,
+`set-window-width`/`set-window-height`, `move-window-to-floating` +
+`move-floating-window`, `maximize-column`, `fullscreen-window`, and column
+rearrangement with `move-column-to-index` / `consume-window-into-column`.
+Maximized and fullscreen are re-verified after applying, because some apps
+restore their own state before the tool acts and would make the toggle
+backfire. If an app opens fewer windows than were recorded (terminals and
+single-instance apps open one window per launch), the instance is relaunched
+up to two more times until the recorded count is matched.
+
+niri's IPC does not expose maximized/fullscreen flags, so they are detected
+geometrically against sibling tiles on the same output (a fullscreen column is
+taller than the baseline tile height because it covers bars and struts; a
+maximized column is the widest tile by a clear margin). This has two blind
+spots, both falling back to `normal` — which the recorded size still restores
+visually: an output where *every* tiled window is fullscreen, and a lone
+maximized window with no other tiled window on the output.
 
 ### What is excluded
 
@@ -120,7 +158,7 @@ shorthands for it. `save` with no `--then` only records the session.
 | `save-quit` | `save --event logout --then quit` |
 | `save-shutdown` / `save-poweroff` | `save --event shutdown --then poweroff` |
 | `save-reboot` | `save --event reboot --then reboot` |
-| `restore [--dry-run]` | Launch the apps from the last snapshot; `--dry-run` only prints what would run. |
+| `restore [--dry-run]` | Launch the apps from the last snapshot and re-place their windows; `--dry-run` only prints the plan, `--no-place` skips placement. |
 | `list` | Show the apps that would be saved right now, with their launch commands — use this to check what the exclusions catch. |
 | `clear` | Delete the saved snapshot (e.g. to skip one restore). |
 
@@ -133,7 +171,7 @@ overwrites it completely; nothing accumulates.
 
 ```json
 {
-  "version": 1,
+  "version": 2,
   "saved_at_epoch_ms": 1795152392416,
   "event": "shutdown",
   "apps": [
@@ -143,7 +181,23 @@ overwrites it completely; nothing accumulates.
       "app_id": "app.fluxer.Fluxer",
       "windows": 1,
       "instances": [
-        { "argv": ["/usr/bin/flatpak", "run", "..."], "cwd": null }
+        {
+          "argv": ["/usr/bin/flatpak", "run", "..."],
+          "cwd": null,
+          "windows": [
+            {
+              "title": "Fluxer",
+              "workspace": { "output": "HDMI-A-1", "name": null, "idx": 2 },
+              "floating": false,
+              "state": "maximized",
+              "pos": null,
+              "size": [2528.0, 1374.0],
+              "column": 1,
+              "tile": 1,
+              "focused": true
+            }
+          ]
+        }
       ]
     }
   ]
@@ -155,12 +209,22 @@ overwrites it completely; nothing accumulates.
 - **Session ends must go through niri-resume.** A crash, a plain `quit` from a
   leftover bind, or a power button handled by logind ends the session without
   a snapshot; the next restore then replays the last successful one.
-- **Windows, not window layout.** Apps are relaunched; their windows end up
-  where niri places them. Workspace arrangement and per-window positions are
-  not restored (niri has no API to place not-yet-opened windows).
-- **Counts are best effort.** One process is one launch: a browser with five
-  windows comes back with one window; five terminals with identical commands
-  come back as five.
+- **Named workspaces must be declared.** niri's IPC cannot create named
+  workspaces at runtime, so windows recorded on a named workspace are only
+  re-placed if you declare it in your config (`workspace "name" { }`);
+  otherwise they are left where they spawn and a note is logged. Numbered
+  workspaces are created on demand and need no declaration.
+- **Tiled positions are column order, not pixels.** niri's scrolling layout
+  has no absolute-position action for tiled windows; restore rebuilds the
+  column order, widths and the maximized/fullscreen states, and finally
+  focuses the window that was focused (which also scrolls the view back to
+  it). Floating windows are restored at their exact size and position.
+- **Counts are best effort.** One process is one app; if it opens fewer
+  windows than recorded, the instance is relaunched (up to twice) to top up.
+  A browser with five windows may still come back with fewer if the app
+  refuses to cooperate.
+- **Monitors.** Windows recorded on an output that is connected again are
+  moved back to it; outputs that vanished are skipped.
 - **Desktop entries are used for names and fallbacks.** Apps without a desktop
   entry are restored from their exact process command line, which is the more
   faithful path anyway.
@@ -172,7 +236,7 @@ overwrites it completely; nothing accumulates.
 
 ## Testing without a session
 
-For scripting and CI, three environment variables override the live sources:
+For scripting and CI, these environment variables override the live sources:
 
 - `NIRI_RESUME_WINDOWS_JSON` — read the window list from this file (a raw
   array or a full IPC reply) instead of talking to niri.
@@ -180,6 +244,8 @@ For scripting and CI, three environment variables override the live sources:
   `$XDG_CONFIG_HOME/niri/config.kdl` (the `NIRI_CONFIG` variable that niri
   itself honors is also respected).
 - `NIRI_RESUME_STATE` — use this path as the state file.
+- `NIRI_RESUME_PLACE_TIMEOUT_MS` — how long restore waits for app windows to
+  appear before placing whatever matched (default 12000).
 
 ```bash
 NIRI_RESUME_WINDOWS_JSON=windows.json NIRI_RESUME_STATE=/tmp/s.json \

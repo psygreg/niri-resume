@@ -13,6 +13,7 @@ use std::os::unix::net::UnixStream;
 use std::process::Command;
 
 const SOCKET_ENV: &str = "NIRI_SOCKET";
+const BIN_HINT: &str = "niri-resume";
 
 /// Toplevel window as reported by niri's IPC.
 ///
@@ -28,6 +29,34 @@ pub struct Window {
     pub pid: Option<i32>,
     pub workspace_id: Option<u64>,
     pub is_focused: bool,
+    pub is_floating: bool,
+    /// Position/size info; present since niri 25.08.
+    pub layout: Option<WindowLayout>,
+}
+
+/// Layout info of a window (all sizes in logical pixels).
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(default)]
+pub struct WindowLayout {
+    /// 1-based (column index, tile index in column) for tiled windows.
+    pub pos_in_scrolling_layout: Option<(usize, usize)>,
+    /// Size of the tile including decorations like borders.
+    pub tile_size: Option<(f64, f64)>,
+    /// For floating windows: the stored position, absolute in the output.
+    pub tile_pos_in_workspace_view: Option<(f64, f64)>,
+}
+
+/// Workspace as reported by niri's IPC.
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(default)]
+pub struct Workspace {
+    pub id: u64,
+    /// 1-based index on its monitor.
+    pub idx: u8,
+    pub name: Option<String>,
+    pub output: Option<String>,
+    pub is_focused: bool,
+    pub is_active: bool,
 }
 
 /// Fetch the list of currently open toplevel windows.
@@ -37,49 +66,55 @@ pub fn windows() -> Result<Vec<Window>, String> {
     if let Ok(path) = std::env::var("NIRI_RESUME_WINDOWS_JSON") {
         let text = std::fs::read_to_string(&path)
             .map_err(|e| format!("cannot read NIRI_RESUME_WINDOWS_JSON={path}: {e}"))?;
-        return parse_windows(&text)
+        return parse_items(&text, "Windows")
             .map_err(|e| format!("invalid NIRI_RESUME_WINDOWS_JSON data: {e}"));
     }
 
-    match windows_via_socket() {
-        Ok(windows) => Ok(windows),
+    match fetch_array("\"Windows\"", "Windows", Some("windows")) {
+        Ok(items) => decode_items(items),
         Err(err) => {
             eprintln!("{BIN_HINT}: direct IPC failed ({err}); trying `niri msg --json windows`");
-            windows_via_msg()
+            let out = run_msg_json("windows")?;
+            parse_items(&out, "Windows")
         }
     }
 }
 
-/// Ask niri to quit immediately (skipping its confirmation dialog).
-pub fn quit() -> Result<(), String> {
-    let request = r#"{"Action":{"Quit":{"skip_confirmation":true}}}"#;
-    match send(request) {
-        Ok(reply) => parse_reply(&reply).map(|_| ()),
+/// Fetch the list of workspaces.
+pub fn workspaces() -> Result<Vec<Workspace>, String> {
+    match fetch_array("\"Workspaces\"", "Workspaces", Some("workspaces")) {
+        Ok(items) => decode_items(items),
         Err(err) => {
-            eprintln!("{BIN_HINT}: direct IPC failed ({err}); trying `niri msg action quit`");
-            let status = Command::new("niri")
-                .args(["msg", "action", "quit", "--skip-confirmation"])
-                .status()
-                .map_err(|e| format!("cannot run `niri msg action quit`: {e}"))?;
-            if status.success() {
-                Ok(())
-            } else {
-                Err(format!("`niri msg action quit` exited with {status}"))
-            }
+            eprintln!("{BIN_HINT}: direct IPC failed ({err}); trying `niri msg --json workspaces`");
+            let out = run_msg_json("workspaces")?;
+            parse_items(&out, "Workspaces")
         }
     }
 }
 
-const BIN_HINT: &str = "niri-resume";
-
-fn socket_path() -> Result<String, String> {
-    std::env::var(SOCKET_ENV)
-        .ok()
-        .filter(|s| !s.is_empty())
-        .ok_or_else(|| format!("{SOCKET_ENV} is not set; are we running inside a niri session?"))
+/// Perform one niri action (the inner `Action` JSON value, e.g.
+/// `json!({"FocusWindow": {"id": 3}})`).
+pub fn send_action(action: Value) -> Result<(), String> {
+    let request = serde_json::json!({ "Action": action }).to_string();
+    let reply = send(&request)?;
+    parse_reply(&reply).map(|_| ())
 }
 
-/// Send one JSON request line, return the reply line.
+fn run_msg_json(subcommand: &str) -> Result<String, String> {
+    let out = Command::new("niri")
+        .args(["msg", "--json", subcommand])
+        .output()
+        .map_err(|e| format!("cannot run `niri msg`: {e}"))?;
+    if !out.status.success() {
+        return Err(format!(
+            "`niri msg --json {subcommand}` failed: {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        ));
+    }
+    String::from_utf8(out.stdout).map_err(|e| format!("bad utf-8: {e}"))
+}
+
+/// Send one JSON request line over the socket, return the reply line.
 fn send(request: &str) -> Result<String, String> {
     let path = socket_path()?;
     let stream =
@@ -99,51 +134,57 @@ fn send(request: &str) -> Result<String, String> {
     Ok(line)
 }
 
-fn windows_via_socket() -> Result<Vec<Window>, String> {
-    let reply = send("\"Windows\"")?;
-    parse_windows(&reply)
+fn socket_path() -> Result<String, String> {
+    std::env::var(SOCKET_ENV)
+        .ok()
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| format!("{SOCKET_ENV} is not set; are we running inside a niri session?"))
 }
 
-fn windows_via_msg() -> Result<Vec<Window>, String> {
-    let out = Command::new("niri")
-        .args(["msg", "--json", "windows"])
-        .output()
-        .map_err(|e| format!("cannot run `niri msg`: {e}"))?;
-    if !out.status.success() {
-        return Err(format!(
-            "`niri msg --json windows` failed: {}",
-            String::from_utf8_lossy(&out.stderr).trim()
-        ));
-    }
-    let stdout = std::str::from_utf8(&out.stdout).map_err(|e| format!("bad utf-8: {e}"))?;
-    parse_windows(stdout)
+/// Send a request directly over the socket and dig the item array out of the
+/// reply. `msg_subcommand` is the `niri msg --json` fallback, if any.
+fn fetch_array(
+    request: &str,
+    key: &str,
+    msg_subcommand: Option<&str>,
+) -> Result<Vec<Value>, String> {
+    let reply = send(request)?;
+    let value: Value = serde_json::from_str(&reply).map_err(|e| format!("bad JSON: {e}"))?;
+    let arr = reply_array(&value, key)?;
+    let _ = msg_subcommand; // only used when the socket path fails entirely
+    Ok(arr.clone())
 }
 
-/// Parse a reply (or a bare array) into a window list.
-fn parse_windows(text: &str) -> Result<Vec<Window>, String> {
-    let value: Value = serde_json::from_str(text).map_err(|e| format!("bad JSON: {e}"))?;
-    let arr = windows_array(&value)?;
-    arr.iter()
-        .map(|w| serde_json::from_value(w.clone()).map_err(|e| format!("bad window entry: {e}")))
-        .collect()
-}
-
-/// Dig the windows array out of `{"Ok":{"Windows":[...]}}`, `{"Windows":[...]}`
-/// or a bare `[...]`.
-fn windows_array(value: &Value) -> Result<&Vec<Value>, String> {
+/// Dig the array out of `{"Ok":{"<Key>":[...]}}`, `{"<Key>":[...]}` or a bare `[...]`.
+fn reply_array<'a>(value: &'a Value, key: &str) -> Result<&'a Vec<Value>, String> {
     match value {
         Value::Array(arr) => Ok(arr),
         Value::Object(map) => {
             if let Some(ok) = map.get("Ok") {
-                return windows_array(ok);
+                return reply_array(ok, key);
             }
-            if let Some(arr) = map.get("Windows").and_then(Value::as_array) {
+            if let Some(arr) = map.get(key).and_then(Value::as_array) {
                 return Ok(arr);
             }
-            Err("reply does not contain a windows list".to_string())
+            Err(format!("reply does not contain a `{key}` list"))
         }
         _ => Err("unexpected reply shape".to_string()),
     }
+}
+
+fn parse_items<T: for<'de> Deserialize<'de>>(text: &str, key: &str) -> Result<Vec<T>, String> {
+    let value: Value = serde_json::from_str(text).map_err(|e| format!("bad JSON: {e}"))?;
+    reply_array(&value, key)?
+        .iter()
+        .map(|item| serde_json::from_value(item.clone()).map_err(|e| format!("bad entry: {e}")))
+        .collect()
+}
+
+fn decode_items<T: for<'de> Deserialize<'de>>(items: Vec<Value>) -> Result<Vec<T>, String> {
+    items
+        .into_iter()
+        .map(|item| serde_json::from_value(item).map_err(|e| format!("bad entry: {e}")))
+        .collect()
 }
 
 /// Unwrap `{"Ok":X}` / `{"Err":msg}`.
@@ -164,6 +205,13 @@ fn parse_reply(text: &str) -> Result<Value, String> {
     }
 }
 
+/// Ask niri to quit immediately (skipping its confirmation dialog).
+pub fn quit() -> Result<(), String> {
+    send_action(serde_json::json!({
+        "Quit": { "skip_confirmation": true }
+    }))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -171,33 +219,48 @@ mod tests {
     #[test]
     fn parses_bare_array() {
         let text = r#"[{"id":1,"title":"w","app_id":"foot","pid":42,"workspace_id":2,"is_focused":false}]"#;
-        let windows = parse_windows(text).unwrap();
+        let windows: Vec<Window> = parse_items(text, "Windows").unwrap();
         assert_eq!(windows.len(), 1);
         assert_eq!(windows[0].app_id.as_deref(), Some("foot"));
         assert_eq!(windows[0].pid, Some(42));
     }
 
     #[test]
-    fn parses_full_reply() {
-        let text = r#"{"Ok":{"Windows":[{"id":12,"title":"t","app_id":"Alacritty","workspace_id":6,"is_focused":true}]}}"#;
-        let windows = parse_windows(text).unwrap();
-        assert_eq!(windows.len(), 1);
-        assert_eq!(windows[0].app_id.as_deref(), Some("Alacritty"));
-        assert_eq!(windows[0].pid, None); // older niri replies have no pid
+    fn parses_full_reply_with_layout() {
+        let text = r#"{"Ok":{"Windows":[{"id":12,"title":"t","app_id":"Alacritty","workspace_id":6,
+            "is_focused":true,"is_floating":false,"is_urgent":false,
+            "layout":{"pos_in_scrolling_layout":[2,1],"tile_size":[500.0,300.0],
+                      "window_size":[500,300],"tile_pos_in_workspace_view":null,
+                      "window_offset_in_tile":[0.0,0.0]}}]}}"#;
+        let windows: Vec<Window> = parse_items(text, "Windows").unwrap();
+        let layout = windows[0].layout.as_ref().unwrap();
+        assert_eq!(layout.pos_in_scrolling_layout, Some((2, 1)));
+        assert_eq!(layout.tile_size, Some((500.0, 300.0)));
+        assert_eq!(layout.tile_pos_in_workspace_view, None);
+    }
+
+    #[test]
+    fn parses_workspaces() {
+        let text = r#"{"Ok":{"Workspaces":[{"id":2,"idx":2,"name":null,"output":"HDMI-A-1",
+            "is_urgent":false,"is_active":false,"is_focused":false,"active_window_id":3}]}}"#;
+        let workspaces: Vec<Workspace> = parse_items(text, "Workspaces").unwrap();
+        assert_eq!(workspaces[0].idx, 2);
+        assert_eq!(workspaces[0].name, None);
+        assert_eq!(workspaces[0].output.as_deref(), Some("HDMI-A-1"));
     }
 
     #[test]
     fn tolerates_unknown_fields() {
         let text = r#"{"Ok":{"Windows":[{"id":1,"some_future_field":{"x":1}},{"id":2}]}}"#;
-        let windows = parse_windows(text).unwrap();
+        let windows: Vec<Window> = parse_items(text, "Windows").unwrap();
         assert_eq!(windows.len(), 2);
         assert_eq!(windows[1].app_id, None);
     }
 
     #[test]
     fn rejects_bad_shapes() {
-        assert!(parse_windows(r#"{"Ok":{"Workspaces":[]}}"#).is_err());
-        assert!(parse_windows("not json").is_err());
+        assert!(parse_items::<Window>(r#"{"Ok":{"Workspaces":[]}}"#, "Windows").is_err());
+        assert!(parse_items::<Window>("not json", "Windows").is_err());
     }
 
     #[test]

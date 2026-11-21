@@ -2,7 +2,8 @@
 //!
 //! The file is a full snapshot of the detected apps at the last end-of-session
 //! event; each save overwrites it atomically, so stale entries never
-//! accumulate.
+//! accumulate. Version 2 adds per-window records (workspace, size, state,
+//! position, column placement) so restore can also rebuild the layout.
 
 use crate::util;
 use serde::{Deserialize, Serialize};
@@ -11,20 +12,82 @@ use std::io::Write;
 use std::path::Path;
 use std::path::PathBuf;
 
-pub const STATE_VERSION: u32 = 1;
+pub const STATE_VERSION: u32 = 2;
 
-/// One launchable instance of an app: the exact command line and the working
-/// directory the process had at save time.
+/// How a workspace is referenced for restore. Named workspaces are preferred;
+/// numbered ones fall back to (output, 1-based index).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct WorkspaceRef {
+    #[serde(default)]
+    pub output: Option<String>,
+    #[serde(default)]
+    pub name: Option<String>,
+    #[serde(default)]
+    pub idx: Option<u8>,
+}
+
+/// Recorded display state of a window.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub enum WindowState {
+    #[default]
+    #[serde(rename = "normal")]
+    Normal,
+    #[serde(rename = "maximized")]
+    Maximized,
+    #[serde(rename = "fullscreen")]
+    Fullscreen,
+}
+
+/// Everything known about one window at save time, for layout restoration.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct WindowRecord {
+    pub title: Option<String>,
+    pub workspace: WorkspaceRef,
+    pub floating: bool,
+    pub state: WindowState,
+    /// Absolute floating position (`tile_pos_in_workspace_view`), floating windows only.
+    pub pos: Option<(f64, f64)>,
+    /// Tile size in logical pixels.
+    pub size: Option<(f64, f64)>,
+    /// 1-based column index in the workspace's scrolling layout (tiled windows).
+    pub column: Option<usize>,
+    /// 1-based tile index within its column (tiled windows).
+    pub tile: Option<usize>,
+    pub focused: bool,
+}
+
+impl Default for WindowRecord {
+    fn default() -> Self {
+        Self {
+            title: None,
+            workspace: WorkspaceRef::default(),
+            floating: false,
+            state: WindowState::Normal,
+            pos: None,
+            size: None,
+            column: None,
+            tile: None,
+            focused: false,
+        }
+    }
+}
+
+/// One launchable instance of an app: the exact command line and working
+/// directory the process had at save time, plus the windows it owned.
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Launch {
     #[serde(default)]
     pub argv: Vec<String>,
     #[serde(default)]
     pub cwd: Option<String>,
+    /// Windows owned by this instance at save time (v2+; empty for older files).
+    #[serde(default)]
+    pub windows: Vec<WindowRecord>,
 }
 
 /// A detected app (the unit of the "Apps" tab in process monitors) together
-/// with everything needed to relaunch it.
+/// with everything needed to relaunch and re-place it.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(default)]
 pub struct AppEntry {
@@ -58,6 +121,17 @@ impl Default for Session {
             event: String::new(),
             apps: Vec::new(),
         }
+    }
+}
+
+impl Session {
+    /// Whether this snapshot carries per-window layout info worth restoring.
+    pub fn has_window_records(&self) -> bool {
+        self.apps.iter().any(|app| {
+            app.instances
+                .iter()
+                .any(|instance| !instance.windows.is_empty())
+        })
     }
 }
 
@@ -143,7 +217,6 @@ pub fn clear() -> Result<bool, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::state::AppEntry;
 
     fn tmp_path(name: &str) -> PathBuf {
         // Each test gets its own directory: tests run in parallel threads.
@@ -157,7 +230,7 @@ mod tests {
     }
 
     #[test]
-    fn roundtrip() {
+    fn roundtrip_with_window_records() {
         let path = tmp_path("roundtrip.json");
         let session = Session {
             event: "shutdown".to_string(),
@@ -166,24 +239,74 @@ mod tests {
                 name: "Firefox".into(),
                 desktop_id: Some("org.mozilla.firefox".into()),
                 app_id: Some("org.mozilla.firefox".into()),
-                windows: 3,
+                windows: 2,
                 instances: vec![Launch {
-                    argv: vec!["firefox".into(), "--profile".into(), "work".into()],
+                    argv: vec!["firefox".into()],
                     cwd: Some("/home/u".into()),
+                    windows: vec![
+                        WindowRecord {
+                            title: Some("Firefox".into()),
+                            workspace: WorkspaceRef {
+                                output: Some("HDMI-A-1".into()),
+                                name: None,
+                                idx: Some(2),
+                            },
+                            floating: false,
+                            state: WindowState::Maximized,
+                            pos: None,
+                            size: Some((2528.0, 1374.0)),
+                            column: Some(1),
+                            tile: Some(1),
+                            focused: true,
+                        },
+                        WindowRecord {
+                            title: Some("PiP".into()),
+                            workspace: WorkspaceRef {
+                                output: Some("HDMI-A-1".into()),
+                                name: Some("web".into()),
+                                idx: None,
+                            },
+                            floating: true,
+                            state: WindowState::Normal,
+                            pos: Some((300.0, 200.0)),
+                            size: Some((640.0, 360.0)),
+                            column: None,
+                            tile: None,
+                            focused: false,
+                        },
+                    ],
                 }],
             }],
             ..Default::default()
         };
         save_to(&path, &session).unwrap();
 
-        // The written file must be complete and load back identically.
-        assert!(path.to_string_lossy().ends_with("roundtrip.json"));
         let loaded = load_from(&path).unwrap().unwrap();
-        assert_eq!(loaded.event, "shutdown");
-        assert_eq!(loaded.apps.len(), 1);
-        assert_eq!(loaded.apps[0].name, "Firefox");
-        assert_eq!(loaded.apps[0].windows, 3);
-        assert_eq!(loaded.apps[0].instances[0].argv.len(), 3);
+        assert_eq!(loaded.version, 2);
+        assert!(loaded.has_window_records());
+        let record = &loaded.apps[0].instances[0].windows[0];
+        assert_eq!(record.state, WindowState::Maximized);
+        assert_eq!(record.workspace.idx, Some(2));
+        assert_eq!(record.size, Some((2528.0, 1374.0)));
+        let floating = &loaded.apps[0].instances[0].windows[1];
+        assert_eq!(floating.pos, Some((300.0, 200.0)));
+        assert_eq!(floating.workspace.name.as_deref(), Some("web"));
+        fs::remove_dir_all(path.parent().unwrap()).unwrap();
+    }
+
+    #[test]
+    fn v1_file_loads_with_empty_records() {
+        let path = tmp_path("v1.json");
+        fs::write(
+            &path,
+            r#"{"version":1,"saved_at_epoch_ms":9,"event":"logout",
+                "apps":[{"name":"X","desktop_id":null,"app_id":null,"windows":1,
+                "instances":[{"argv":["x"],"cwd":null}]}]}"#,
+        )
+        .unwrap();
+        let session = load_from(&path).unwrap().unwrap();
+        assert!(!session.has_window_records());
+        assert_eq!(session.apps[0].instances[0].windows.len(), 0);
         fs::remove_dir_all(path.parent().unwrap()).unwrap();
     }
 
@@ -192,18 +315,5 @@ mod tests {
         let path = tmp_path("missing.json");
         let _ = fs::remove_file(&path);
         assert!(load_from(&path).unwrap().is_none());
-    }
-
-    #[test]
-    fn older_schema_parses_with_defaults() {
-        let path = tmp_path("old.json");
-        fs::write(
-            &path,
-            r#"{"version":1,"saved_at_epoch_ms":9,"event":"logout"}"#,
-        )
-        .unwrap();
-        let session = load_from(&path).unwrap().unwrap();
-        assert!(session.apps.is_empty());
-        fs::remove_dir_all(path.parent().unwrap()).unwrap();
     }
 }

@@ -13,12 +13,16 @@ mod apps;
 mod config;
 mod desktop;
 mod ipc;
+mod place;
 mod state;
 mod util;
 
-use std::collections::HashSet;
+use place::ExpectedWindow;
+use state::{AppEntry, Session, WorkspaceRef};
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::process::{Command, ExitCode};
+use std::time::{Duration, Instant};
 
 const BIN: &str = "niri-resume";
 
@@ -30,7 +34,9 @@ Usage:
   niri-resume save-quit                  Save, then quit niri (logout).
   niri-resume save-shutdown              Save, then power the machine off.
   niri-resume save-reboot                Save, then reboot the machine.
-  niri-resume restore [--dry-run]        Launch the apps from the last save.
+  niri-resume restore [--dry-run] [--no-place]
+                                         Launch the apps from the last save
+                                         and re-place their windows.
   niri-resume list                       Show the apps that would be saved.
   niri-resume clear                      Delete the saved session.
   niri-resume help                       Show this help.
@@ -67,13 +73,15 @@ fn run(args: &[String]) -> Result<(), String> {
         "save-reboot" => save(&parse_save_flags(rest)?, "reboot", Some("reboot")),
         "restore" => {
             let mut dry_run = false;
+            let mut no_place = false;
             for arg in rest {
                 match arg.as_str() {
                     "--dry-run" => dry_run = true,
+                    "--no-place" => no_place = true,
                     other => return Err(format!("unknown flag `{other}` for restore")),
                 }
             }
-            restore(dry_run)
+            restore(dry_run, no_place)
         }
         "list" => list(),
         "clear" => clear(),
@@ -129,11 +137,12 @@ fn save(flags: &SaveFlags, default_event: &str, forced_then: Option<&str>) -> Re
     let then = forced_then.or(flags.then.as_deref());
 
     let windows = ipc::windows()?;
+    let workspaces = ipc::workspaces().unwrap_or_default();
     let excluded = apps::exclusion_set(config::spawn_names());
     let db = desktop::Database::load();
-    let detected = apps::collect(&windows, &db, &excluded);
+    let detected = apps::collect(&windows, &workspaces, &db, &excluded);
 
-    let session = state::Session {
+    let session = Session {
         version: state::STATE_VERSION,
         saved_at_epoch_ms: now_epoch_ms(),
         event,
@@ -175,24 +184,23 @@ fn systemctl(action: &str) -> Result<(), String> {
     }
 }
 
-/// Relaunch the apps recorded at the last end-of-session event.
-fn restore(dry_run: bool) -> Result<(), String> {
-    let Some(session) = state::load()? else {
-        eprintln!("{BIN}: no saved session found; nothing to restore");
-        return Ok(());
-    };
-    if session.version > state::STATE_VERSION {
-        eprintln!(
-            "{BIN}: state file version {} is newer than this build; trying anyway",
-            session.version
-        );
-    }
+/// One entry of the restore spawn plan: an app instance plus the app-level
+/// info needed for window matching.
+struct SpawnItem {
+    name: String,
+    app_id: Option<String>,
+    desktop_id: Option<String>,
+    instance: state::Launch,
+    windows: Vec<state::WindowRecord>,
+}
 
+/// Build the spawn plan from the saved session, applying the restore-time
+/// exclusions (niri config startups, XDG autostart) and deduplication.
+fn build_spawn_plan(session: &Session) -> (Vec<SpawnItem>, usize) {
     let excluded = apps::exclusion_set(config::spawn_names());
     let autostart = desktop::autostart_desktop_ids();
-    let db = desktop::Database::load();
 
-    let mut launched = 0usize;
+    let mut items: Vec<SpawnItem> = Vec::new();
     let mut skipped = 0usize;
     for app in &session.apps {
         let mut seen: HashSet<(String, Option<String>)> = HashSet::new();
@@ -213,38 +221,254 @@ fn restore(dry_run: bool) -> Result<(), String> {
                 skipped += 1;
                 continue;
             }
-            if dry_run {
-                println!(
-                    "would launch {}: {} (cwd: {})",
-                    app.name,
-                    instance.argv.join(" "),
-                    instance.cwd.as_deref().unwrap_or("~")
-                );
-                launched += 1;
-            } else {
-                match spawn_instance(instance, app.desktop_id.as_deref(), &db) {
-                    Ok(()) => {
-                        launched += 1;
-                        eprintln!("{BIN}: launched {}", app.name);
-                    }
-                    Err(e) => eprintln!("{BIN}: failed to launch {}: {e}", app.name),
-                }
-            }
+            items.push(SpawnItem {
+                name: app.name.clone(),
+                app_id: app.app_id.clone(),
+                desktop_id: app.desktop_id.clone(),
+                instance: instance.clone(),
+                windows: instance.windows.clone(),
+            });
         }
     }
+    (items, skipped)
+}
+
+fn restore(dry_run: bool, no_place: bool) -> Result<(), String> {
+    let Some(session) = state::load()? else {
+        eprintln!("{BIN}: no saved session found; nothing to restore");
+        return Ok(());
+    };
+    if session.version > state::STATE_VERSION {
+        eprintln!(
+            "{BIN}: state file version {} is newer than this build; trying anyway",
+            session.version
+        );
+    }
+    let placeable = !no_place && session.has_window_records();
+
+    let (items, skipped) = build_spawn_plan(&session);
 
     if dry_run {
-        println!("{BIN}: dry run — would launch {launched} instance(s), skipping {skipped}");
-    } else {
-        eprintln!("{BIN}: restore finished: {launched} launched, {skipped} skipped");
+        for item in &items {
+            println!(
+                "would launch {}: {} (cwd: {})",
+                item.name,
+                item.instance.argv.join(" "),
+                item.instance.cwd.as_deref().unwrap_or("~")
+            );
+            for record in &item.windows {
+                let ws = describe_workspace(&record.workspace);
+                let pos = record
+                    .pos
+                    .map(|(x, y)| format!(" at ({x:.0},{y:.0})"))
+                    .unwrap_or_default();
+                let size = record
+                    .size
+                    .map(|(w, h)| format!(" {}x{}", w as i32, h as i32))
+                    .unwrap_or_default();
+                let column = record
+                    .column
+                    .map(|c| format!(", column {c}"))
+                    .unwrap_or_default();
+                println!(
+                    "    window: {} — {}{pos}{size}{column}{}",
+                    record.title.as_deref().unwrap_or("(no title)"),
+                    ws,
+                    match record.state {
+                        state::WindowState::Fullscreen => ", fullscreen",
+                        state::WindowState::Maximized => ", maximized",
+                        state::WindowState::Normal => "",
+                    }
+                );
+            }
+        }
+        println!(
+            "{BIN}: dry run — would launch {} instance(s), skipping {skipped}",
+            items.len()
+        );
+        return Ok(());
     }
+
+    // Snapshot the windows that already exist, so freshly spawned ones can be
+    // told apart during matching.
+    let pre_windows = ipc::windows();
+    let ipc_available = pre_windows.is_ok();
+    let pre_spawn_ids: HashSet<u64> = match pre_windows {
+        Ok(windows) => windows.iter().map(|w| w.id).collect(),
+        Err(e) => {
+            eprintln!("{BIN}: cannot reach niri IPC ({e}); windows will not be re-placed");
+            HashSet::new()
+        }
+    };
+
+    let mut spawned_pids: HashMap<usize, Vec<u32>> = HashMap::new();
+    let mut launched = 0usize;
+    for (index, item) in items.iter().enumerate() {
+        match spawn_instance(&item.instance, item.desktop_id.as_deref()) {
+            Ok(pid) => {
+                launched += 1;
+                if let Some(pid) = pid {
+                    spawned_pids.entry(index).or_default().push(pid);
+                } else {
+                    spawned_pids.entry(index).or_default();
+                }
+                eprintln!("{BIN}: launched {}", item.name);
+            }
+            Err(e) => eprintln!("{BIN}: failed to launch {}: {e}", item.name),
+        }
+    }
+    eprintln!("{BIN}: restore finished: {launched} launched, {skipped} skipped");
+
+    if placeable && ipc_available {
+        place_windows(&items, &mut spawned_pids, &pre_spawn_ids);
+    }
+
     Ok(())
+}
+
+fn describe_workspace(ws: &WorkspaceRef) -> String {
+    if let Some(name) = &ws.name {
+        format!("workspace '{name}'")
+    } else if let Some(idx) = ws.idx {
+        format!("workspace {idx}")
+    } else {
+        "current workspace".to_string()
+    }
+}
+
+/// Match freshly opened windows to the recorded ones and re-place them.
+/// Single-launch apps that open one window per launch get "top-up" spawns
+/// until the recorded window count is matched (bounded to two extra rounds).
+fn place_windows(
+    items: &[SpawnItem],
+    spawned_pids: &mut HashMap<usize, Vec<u32>>,
+    pre_spawn_ids: &HashSet<u64>,
+) {
+    let mut expected: Vec<ExpectedWindow> = Vec::new();
+    for (index, item) in items.iter().enumerate() {
+        for record in &item.windows {
+            expected.push(ExpectedWindow {
+                instance: index,
+                app_id: item.app_id.clone(),
+                record: record.clone(),
+            });
+        }
+    }
+    if expected.is_empty() {
+        return;
+    }
+
+    let timeout = std::env::var("NIRI_RESUME_PLACE_TIMEOUT_MS")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .unwrap_or(12_000);
+    let base_delay = Duration::from_millis(120);
+
+    let poll_until = |matched: &mut Vec<Option<u64>>,
+                      deadline: Instant,
+                      pids: &HashMap<usize, Vec<u32>>|
+     -> bool {
+        loop {
+            if let Ok(current) = ipc::windows() {
+                *matched = place::match_windows(
+                    &expected,
+                    pre_spawn_ids,
+                    &current,
+                    pids,
+                    &place::pid_is_descendant,
+                );
+                if matched.iter().all(|m| m.is_some()) {
+                    return true;
+                }
+            }
+            if Instant::now() >= deadline {
+                return false;
+            }
+            std::thread::sleep(Duration::from_millis(250));
+        }
+    };
+
+    eprintln!(
+        "{BIN}: waiting up to {} ms for app windows to appear…",
+        timeout
+    );
+    let mut matched: Vec<Option<u64>> = vec![None; expected.len()];
+    let mut all_matched = poll_until(
+        &mut matched,
+        Instant::now() + Duration::from_millis(timeout),
+        spawned_pids,
+    );
+
+    // Top-up spawning: the snapshot may hold several windows of an app that
+    // opens one window per launch (terminals, single-instance handoffs).
+    for _ in 0..2 {
+        if all_matched {
+            break;
+        }
+        let missing: HashMap<usize, usize> = expected
+            .iter()
+            .zip(&matched)
+            .filter(|(_, m)| m.is_none())
+            .fold(HashMap::new(), |mut acc, (exp, _)| {
+                *acc.entry(exp.instance).or_default() += 1;
+                acc
+            });
+        if missing.is_empty() {
+            break;
+        }
+        for (index, _) in missing {
+            let item = &items[index];
+            match spawn_instance(&item.instance, item.desktop_id.as_deref()) {
+                Ok(Some(pid)) => spawned_pids.entry(index).or_default().push(pid),
+                Ok(None) => {}
+                Err(e) => eprintln!("{BIN}: top-up spawn failed for {}: {e}", item.name),
+            }
+            eprintln!(
+                "{BIN}: relaunched {} for its remaining window(s)",
+                item.name
+            );
+            std::thread::sleep(Duration::from_millis(600));
+        }
+        all_matched = poll_until(
+            &mut matched,
+            Instant::now() + Duration::from_secs(6),
+            spawned_pids,
+        );
+    }
+
+    let matched_count = matched.iter().flatten().count();
+    if matched_count == 0 {
+        eprintln!("{BIN}: no app windows could be matched; skipping window placement");
+        return;
+    }
+
+    let Ok(current) = ipc::windows() else { return };
+    let workspaces = ipc::workspaces().unwrap_or_default();
+    let plan = place::plan(&expected, &matched, &current, &workspaces);
+    for note in &plan.skipped {
+        eprintln!("{BIN}: {note}");
+    }
+    let applied = place::execute(&plan.steps, base_delay);
+    verify_placement(&expected, &matched, base_delay);
+
+    eprintln!(
+        "{BIN}: placed {matched_count}/{} recorded window(s) with {applied} action(s)",
+        expected.len()
+    );
+}
+
+fn verify_placement(expected: &[ExpectedWindow], matched: &[Option<u64>], base_delay: Duration) {
+    // Give the last state action time to settle, then re-check maximized and
+    // fullscreen records once (apps may have restored their own state first,
+    // making our toggle a no-op in the wrong direction).
+    std::thread::sleep(Duration::from_millis(500));
+    place::verify_states(expected, matched, base_delay);
 }
 
 /// Restore-time exclusions: anything niri config starts at startup, anything
 /// XDG autostart would start anyway, and (defensively) this tool itself.
 fn is_restore_excluded(
-    app: &state::AppEntry,
+    app: &AppEntry,
     instance: &state::Launch,
     excluded: &HashSet<String>,
     autostart: &HashSet<String>,
@@ -271,11 +495,12 @@ fn is_restore_excluded(
     false
 }
 
+/// Spawn one instance; returns the child's PID when available (used for
+/// window matching).
 fn spawn_instance(
     instance: &state::Launch,
     desktop_id: Option<&str>,
-    db: &desktop::Database,
-) -> Result<(), String> {
+) -> Result<Option<u32>, String> {
     let cwd: PathBuf = instance
         .cwd
         .as_ref()
@@ -290,12 +515,12 @@ fn spawn_instance(
     cmd.current_dir(&cwd);
 
     match cmd.spawn() {
-        Ok(_child) => Ok(()),
+        Ok(child) => Ok(Some(child.id())),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
             // The binary moved or was removed: try the canonical launch from
             // the matched desktop entry instead.
             if let Some(id) = desktop_id {
-                if let Some(entry) = db.by_id(id) {
+                if let Some(entry) = desktop_db().by_id(id) {
                     if desktop::try_exec_exists(entry) {
                         if let Some(exec) = &entry.exec {
                             let argv = desktop::exec_to_argv(exec);
@@ -309,7 +534,7 @@ fn spawn_instance(
                                     .filter(|p| p.is_dir())
                                     .unwrap_or_else(|| cwd.clone());
                                 cmd.current_dir(dir);
-                                return cmd.spawn().map(|_| ()).map_err(fail);
+                                return cmd.spawn().map(|child| Some(child.id())).map_err(fail);
                             }
                         }
                     }
@@ -321,11 +546,16 @@ fn spawn_instance(
     }
 }
 
+fn desktop_db() -> desktop::Database {
+    desktop::Database::load()
+}
+
 fn list() -> Result<(), String> {
     let windows = ipc::windows()?;
+    let workspaces = ipc::workspaces().unwrap_or_default();
     let excluded = apps::exclusion_set(config::spawn_names());
     let db = desktop::Database::load();
-    let detected = apps::collect(&windows, &db, &excluded);
+    let detected = apps::collect(&windows, &workspaces, &db, &excluded);
 
     println!(
         "{} open toplevel window(s) grouped into {} app(s):",
@@ -346,6 +576,31 @@ fn list() -> Result<(), String> {
                 instance.argv.join(" "),
                 instance.cwd.as_deref().unwrap_or("~")
             );
+            for record in &instance.windows {
+                let state = match record.state {
+                    state::WindowState::Fullscreen => "fullscreen",
+                    state::WindowState::Maximized => "maximized",
+                    state::WindowState::Normal => "normal",
+                };
+                let extra = if record.floating {
+                    record
+                        .pos
+                        .map(|(x, y)| format!("floating at ({x:.0},{y:.0})"))
+                        .unwrap_or_else(|| "floating".to_string())
+                } else {
+                    record
+                        .column
+                        .map(|c| format!("column {c}"))
+                        .unwrap_or_else(|| "tiled".to_string())
+                };
+                println!(
+                    "    window: {} — {}, {}, {}",
+                    record.title.as_deref().unwrap_or("(no title)"),
+                    describe_workspace(&record.workspace),
+                    state,
+                    extra
+                );
+            }
         }
     }
     Ok(())

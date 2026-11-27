@@ -23,7 +23,12 @@ it trigger the session-ending action (quit niri, `systemctl poweroff`, or
 
 **Startup** (`restore`, from `spawn-at-startup`): the tool reads the snapshot
 and launches each recorded app with its exact original command line and working
-directory. If a recorded binary has since moved or disappeared, it falls back
+directory. When a recorded process is the inner binary of a wrapper — Nix's
+`chromium` wrapper execs `…-chromium-unwrapped/libexec/chromium/chromium`,
+distro Firefox scripts exec `/usr/lib*/firefox/firefox`, and `env VAR=… app`
+has the same shape — the app's desktop entry `Exec` is used instead, because
+only the wrapper sets up the sandbox, library paths and Wayland flags the app
+needs. If a recorded binary has since moved or disappeared, it also falls back
 to the app's desktop entry `Exec` command. It then watches the compositor for
 the freshly opened windows, matches them against the recorded ones, and
 re-places each one (see the next section).
@@ -40,7 +45,7 @@ Window → process mapping uses the PID that niri reports for each window
 (available since the `Window.pid` IPC field). From there the tool reads
 `/proc/<pid>` for the executable, argv and working directory, and matches
 desktop entries (by desktop id, `StartupWMClass`, or `Exec` binary name) for
-names and fallback launch commands.
+names and for wrapper-aware (or fallback) launch commands.
 
 ### Window layout restore
 
@@ -225,9 +230,12 @@ overwrites it completely; nothing accumulates.
   refuses to cooperate.
 - **Monitors.** Windows recorded on an output that is connected again are
   moved back to it; outputs that vanished are skipped.
-- **Desktop entries are used for names and fallbacks.** Apps without a desktop
-  entry are restored from their exact process command line, which is the more
-  faithful path anyway.
+- **Desktop entries are used for names, wrappers and fallbacks.** A desktop
+  entry whose `Exec` starts a different program than the saved process (Nix
+  packages, `env`-prefixed entries, shell wrappers) is authoritative on restore,
+  because the wrapper carries the environment the inner binary needs. Apps
+  without a desktop entry are restored from their exact process command line,
+  which is the more faithful path anyway.
 - **`Terminal=true` apps** are launched bare; wrap them in your terminal
   manually if you use such entries.
 - Portal dialogs (e.g. an open file chooser) belong to portal processes that

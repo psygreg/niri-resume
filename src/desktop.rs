@@ -8,7 +8,9 @@
 
 use crate::util;
 use std::collections::{HashMap, HashSet};
+use std::ffi::OsStr;
 use std::fs;
+use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 
 /// One parsed `[Desktop Entry]` section.
@@ -312,6 +314,51 @@ pub fn try_exec_exists(entry: &Entry) -> bool {
     false
 }
 
+/// Resolve a program token (a desktop `Exec` first word, `/proc` argv[0] or
+/// an executable path) to the file it would execute. Paths are used as given;
+/// bare names are searched in `PATH`. The result is canonicalized so symlinked
+/// aliases compare equal.
+pub fn resolve_program(name: &str) -> Option<PathBuf> {
+    resolve_program_in(name, std::env::var_os("PATH").as_deref())
+}
+
+fn resolve_program_in(name: &str, path_var: Option<&OsStr>) -> Option<PathBuf> {
+    if name.is_empty() {
+        return None;
+    }
+    let candidate = if name.contains('/') {
+        PathBuf::from(name)
+    } else {
+        std::env::split_paths(path_var?)
+            .map(|dir| dir.join(name))
+            .find(|candidate| is_executable_file(candidate))?
+    };
+    if !is_executable_file(&candidate) {
+        return None;
+    }
+    Some(fs::canonicalize(&candidate).unwrap_or(candidate))
+}
+
+fn is_executable_file(path: &Path) -> bool {
+    path.metadata()
+        .map(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
+        .unwrap_or(false)
+}
+
+/// Do two program tokens name the same executable after `PATH` lookup and
+/// symlink resolution? Identical tokens count as the same even when they no
+/// longer exist, so an unchanged saved command is not replaced by a stale
+/// `Exec`.
+pub fn same_program(a: &str, b: &str) -> bool {
+    if a == b {
+        return true;
+    }
+    match (resolve_program(a), resolve_program(b)) {
+        (Some(a), Some(b)) => a == b,
+        _ => false,
+    }
+}
+
 /// Parse a desktop entry `Exec` value into argv, per the Desktop Entry Spec:
 /// shell-like quoting, `%%` → literal `%`, and field codes (`%f %F %u %U %i
 /// %c %k` and the deprecated ones) dropped — we launch without file arguments.
@@ -528,5 +575,46 @@ mod tests {
         assert!(try_exec_exists(&e));
         e.try_exec = Some("/definitely/not/here".into());
         assert!(!try_exec_exists(&e));
+    }
+
+    #[test]
+    fn resolves_programs_through_path_and_symlinks() {
+        let dir = std::env::temp_dir().join(format!("niri-resume-resolve-{}", std::process::id()));
+        let bin = dir.join("bin");
+        fs::create_dir_all(&bin).unwrap();
+        let real = bin.join("real-app");
+        fs::write(&real, "#!/bin/sh\n").unwrap();
+        fs::set_permissions(&real, fs::Permissions::from_mode(0o755)).unwrap();
+        let alias = bin.join("alias-app");
+        std::os::unix::fs::symlink(&real, &alias).unwrap();
+        let path_var = std::ffi::OsString::from(&bin);
+
+        let real_canonical = fs::canonicalize(&real).unwrap();
+        assert_eq!(
+            resolve_program_in("alias-app", Some(path_var.as_os_str())),
+            Some(real_canonical.clone())
+        );
+        assert_eq!(
+            resolve_program_in(real.to_str().unwrap(), None),
+            Some(real_canonical)
+        );
+        assert_eq!(
+            resolve_program_in("missing-app", Some(path_var.as_os_str())),
+            None
+        );
+        assert!(same_program(
+            alias.to_str().unwrap(),
+            real.to_str().unwrap()
+        ));
+        assert!(!same_program(alias.to_str().unwrap(), "/bin/sh"));
+
+        let not_executable = bin.join("not-executable");
+        fs::write(&not_executable, "").unwrap();
+        assert_eq!(
+            resolve_program_in(not_executable.to_str().unwrap(), None),
+            None
+        );
+
+        fs::remove_dir_all(&dir).unwrap();
     }
 }

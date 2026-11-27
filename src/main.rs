@@ -247,14 +247,21 @@ fn restore(dry_run: bool, no_place: bool) -> Result<(), String> {
     let placeable = !no_place && session.has_window_records();
 
     let (items, skipped) = build_spawn_plan(&session);
+    let db = desktop::Database::load();
 
     if dry_run {
         for item in &items {
+            let entry = item.desktop_id.as_deref().and_then(|id| db.by_id(id));
+            let launch = launch_command(&item.instance, entry);
             println!(
                 "would launch {}: {} (cwd: {})",
                 item.name,
-                item.instance.argv.join(" "),
-                item.instance.cwd.as_deref().unwrap_or("~")
+                launch.argv.join(" "),
+                launch
+                    .cwd
+                    .as_ref()
+                    .map(|p| p.display().to_string())
+                    .unwrap_or_else(|| "~".to_string())
             );
             for record in &item.windows {
                 let ws = describe_workspace(&record.workspace);
@@ -304,7 +311,7 @@ fn restore(dry_run: bool, no_place: bool) -> Result<(), String> {
     let mut spawned_pids: HashMap<usize, Vec<u32>> = HashMap::new();
     let mut launched = 0usize;
     for (index, item) in items.iter().enumerate() {
-        match spawn_instance(&item.instance, item.desktop_id.as_deref()) {
+        match spawn_instance(&item.instance, item.desktop_id.as_deref(), &db) {
             Ok(pid) => {
                 launched += 1;
                 if let Some(pid) = pid {
@@ -320,7 +327,7 @@ fn restore(dry_run: bool, no_place: bool) -> Result<(), String> {
     eprintln!("{BIN}: restore finished: {launched} launched, {skipped} skipped");
 
     if placeable && ipc_available {
-        place_windows(&items, &mut spawned_pids, &pre_spawn_ids);
+        place_windows(&items, &mut spawned_pids, &pre_spawn_ids, &db);
     }
 
     Ok(())
@@ -343,6 +350,7 @@ fn place_windows(
     items: &[SpawnItem],
     spawned_pids: &mut HashMap<usize, Vec<u32>>,
     pre_spawn_ids: &HashSet<u64>,
+    db: &desktop::Database,
 ) {
     let mut expected: Vec<ExpectedWindow> = Vec::new();
     for (index, item) in items.iter().enumerate() {
@@ -418,7 +426,7 @@ fn place_windows(
         }
         for (index, _) in missing {
             let item = &items[index];
-            match spawn_instance(&item.instance, item.desktop_id.as_deref()) {
+            match spawn_instance(&item.instance, item.desktop_id.as_deref(), db) {
                 Ok(Some(pid)) => spawned_pids.entry(index).or_default().push(pid),
                 Ok(None) => {}
                 Err(e) => eprintln!("{BIN}: top-up spawn failed for {}: {e}", item.name),
@@ -495,59 +503,117 @@ fn is_restore_excluded(
     false
 }
 
+/// The command restore will run: the saved command line, or the desktop
+/// entry's `Exec` when that starts a different program (the wrapper case).
+struct LaunchCommand {
+    argv: Vec<String>,
+    cwd: Option<PathBuf>,
+}
+
+/// Pick the restore command for one saved instance.
+///
+/// The exact saved command line wins unless the app's desktop entry starts a
+/// different executable. Wrapped apps record the wrapper's inner process in
+/// `/proc` — Nix's `chromium` wrapper execs `…-chromium-unwrapped/libexec/…`,
+/// Fedora's `firefox` script execs `/usr/lib64/firefox/firefox`, `env VAR=…`
+/// and `sh -c …` entries have the same shape. Relaunching the inner binary
+/// bypasses the sandbox/`LD_LIBRARY_PATH`/Wayland environment the wrapper sets
+/// (Nix's unwrapped Chromium dies with `SIGILL`), so when the resolved programs
+/// differ the desktop entry is authoritative. This also repairs state files
+/// written before wrapper-aware saving: their saved command line still starts
+/// the inner binary.
+fn launch_command(instance: &state::Launch, entry: Option<&desktop::Entry>) -> LaunchCommand {
+    let saved_cwd = instance
+        .cwd
+        .as_ref()
+        .map(PathBuf::from)
+        .filter(|p| p.is_dir());
+
+    let entry_argv = entry
+        .filter(|e| desktop::try_exec_exists(e))
+        .and_then(|e| e.exec.as_deref())
+        .map(desktop::exec_to_argv)
+        .filter(|argv| !argv.is_empty());
+
+    if let (Some(exec_argv), Some(saved0)) = (&entry_argv, instance.argv.first()) {
+        if !desktop::same_program(saved0, &exec_argv[0])
+            && desktop::resolve_program(&exec_argv[0]).is_some()
+        {
+            let cwd = entry
+                .and_then(|e| e.path.as_deref())
+                .map(PathBuf::from)
+                .filter(|p| p.is_dir())
+                .or(saved_cwd);
+            return LaunchCommand {
+                argv: exec_argv.clone(),
+                cwd,
+            };
+        }
+    }
+
+    LaunchCommand {
+        argv: instance.argv.clone(),
+        cwd: saved_cwd,
+    }
+}
+
 /// Spawn one instance; returns the child's PID when available (used for
 /// window matching).
 fn spawn_instance(
     instance: &state::Launch,
     desktop_id: Option<&str>,
+    db: &desktop::Database,
 ) -> Result<Option<u32>, String> {
-    let cwd: PathBuf = instance
-        .cwd
-        .as_ref()
-        .map(PathBuf::from)
-        .filter(|p| p.is_dir())
-        .or_else(util::home_dir)
-        .unwrap_or_else(|| PathBuf::from("/"));
+    let entry = desktop_id.and_then(|id| db.by_id(id));
+    let primary = launch_command(instance, entry);
+    if primary.argv != instance.argv {
+        eprintln!(
+            "{BIN}: desktop entry starts a different program; launching `{}` instead of `{}`",
+            primary.argv.join(" "),
+            instance.argv.join(" ")
+        );
+    }
 
-    let fail = |e: std::io::Error| format!("cannot launch `{}`: {e}", instance.argv[0]);
-    let mut cmd = Command::new(&instance.argv[0]);
-    cmd.args(&instance.argv[1..]);
-    cmd.current_dir(&cwd);
-
-    match cmd.spawn() {
-        Ok(child) => Ok(Some(child.id())),
+    match spawn_command(&primary) {
+        Ok(pid) => Ok(Some(pid)),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
             // The binary moved or was removed: try the canonical launch from
-            // the matched desktop entry instead.
-            if let Some(id) = desktop_id {
-                if let Some(entry) = desktop_db().by_id(id) {
-                    if desktop::try_exec_exists(entry) {
-                        if let Some(exec) = &entry.exec {
-                            let argv = desktop::exec_to_argv(exec);
-                            if !argv.is_empty() {
-                                let mut cmd = Command::new(&argv[0]);
-                                cmd.args(&argv[1..]);
-                                let dir = entry
-                                    .path
-                                    .as_ref()
-                                    .map(PathBuf::from)
-                                    .filter(|p| p.is_dir())
-                                    .unwrap_or_else(|| cwd.clone());
-                                cmd.current_dir(dir);
-                                return cmd.spawn().map(|child| Some(child.id())).map_err(fail);
-                            }
-                        }
-                    }
+            // the matched desktop entry instead (unless that is already what
+            // we ran).
+            let fallback = entry.and_then(|entry| {
+                let argv = entry.exec.as_deref().map(desktop::exec_to_argv)?;
+                if argv.is_empty() || argv == primary.argv {
+                    return None;
                 }
+                let cwd = entry
+                    .path
+                    .as_deref()
+                    .map(PathBuf::from)
+                    .filter(|p| p.is_dir())
+                    .or_else(|| primary.cwd.clone());
+                Some(LaunchCommand { argv, cwd })
+            });
+            match fallback {
+                Some(command) => spawn_command(&command)
+                    .map(Some)
+                    .map_err(|e| format!("cannot launch `{}`: {e}", command.argv[0])),
+                None => Err(format!("cannot launch `{}`: {e}", primary.argv[0])),
             }
-            Err(fail(e))
         }
-        Err(e) => Err(fail(e)),
+        Err(e) => Err(format!("cannot launch `{}`: {e}", primary.argv[0])),
     }
 }
 
-fn desktop_db() -> desktop::Database {
-    desktop::Database::load()
+fn spawn_command(command: &LaunchCommand) -> std::io::Result<u32> {
+    let cwd = command
+        .cwd
+        .clone()
+        .or_else(util::home_dir)
+        .unwrap_or_else(|| PathBuf::from("/"));
+    let mut cmd = Command::new(&command.argv[0]);
+    cmd.args(&command.argv[1..]);
+    cmd.current_dir(cwd);
+    cmd.spawn().map(|child| child.id())
 }
 
 fn list() -> Result<(), String> {
@@ -620,4 +686,75 @@ fn now_epoch_ms() -> u64 {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_millis() as u64)
         .unwrap_or(0)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::os::unix::fs::PermissionsExt;
+
+    fn temp_dir(tag: &str) -> PathBuf {
+        std::env::temp_dir().join(format!("niri-resume-{tag}-{}", std::process::id()))
+    }
+
+    fn fake_bin(path: &std::path::Path) -> String {
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, "#!/bin/sh\n").unwrap();
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        path.to_string_lossy().into_owned()
+    }
+
+    fn saved_launch(argv: Vec<String>) -> state::Launch {
+        state::Launch {
+            argv,
+            cwd: Some("/tmp".into()),
+            windows: Vec::new(),
+        }
+    }
+
+    fn desktop_entry(exec: String) -> desktop::Entry {
+        desktop::Entry {
+            id: "test".into(),
+            exec: Some(exec),
+            ..desktop::Entry::default()
+        }
+    }
+
+    #[test]
+    fn launch_command_replaces_wrapper_inner_binary_with_exec() {
+        let dir = temp_dir("launch-wrapper");
+        let wrapper = fake_bin(&dir.join("bin/chromium"));
+        let inner = fake_bin(&dir.join("libexec/chromium/chromium"));
+
+        let command = launch_command(
+            &saved_launch(vec![inner]),
+            Some(&desktop_entry(format!("{wrapper} %U"))),
+        );
+        assert_eq!(command.argv, vec![wrapper]);
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn launch_command_keeps_saved_argv_for_the_same_program() {
+        let dir = temp_dir("launch-same");
+        let app = fake_bin(&dir.join("app"));
+
+        let command = launch_command(
+            &saved_launch(vec![app.clone(), "--profile".into(), "work".into()]),
+            Some(&desktop_entry(format!("{app} %u"))),
+        );
+        assert_eq!(command.argv, vec![app, "--profile".into(), "work".into()]);
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn launch_command_keeps_saved_argv_when_exec_is_stale() {
+        let command = launch_command(
+            &saved_launch(vec!["/definitely/not/here/app".into()]),
+            Some(&desktop_entry("/definitely/not/here/other %u".into())),
+        );
+        assert_eq!(command.argv, vec!["/definitely/not/here/app"]);
+    }
 }

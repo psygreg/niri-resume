@@ -414,10 +414,14 @@ fn window_record(
 /// Decide the launch command for a window's owning process.
 ///
 /// Prefers the exact command line (that is what "resume this session" means),
-/// unless it disagrees with the matched desktop entry — which happens for X11
-/// windows under xwayland-satellite (the connection owner is satellite, not
-/// the app) and for wrapper-script launches — in which case the desktop
-/// entry's `Exec` is the correct thing to relaunch.
+/// unless the desktop entry starts a *different executable* — which happens for
+/// wrapper launches: the Nix `chromium` wrapper execs
+/// `…-chromium-unwrapped/libexec/chromium/chromium`, Fedora's `firefox` script
+/// execs `/usr/lib64/firefox/firefox`, and `env VAR=… app`, `sh -c …` and
+/// X11-under-xwayland-satellite have the same shape. Basenames alone cannot
+/// tell those apart, so programs are resolved through `PATH` and symlinks; when
+/// they differ, the desktop `Exec` is the correct relaunch because only it
+/// knows about the wrapper's environment and flags.
 fn instance(proc: Option<&ProcInfo>, entry: Option<&Entry>) -> Option<Launch> {
     if let Some(p) = proc {
         let argv: Vec<String> = if p.argv.is_empty() {
@@ -453,8 +457,10 @@ fn instance(proc: Option<&ProcInfo>, entry: Option<&Entry>) -> Option<Launch> {
     None
 }
 
-/// Does the desktop entry's `Exec` name the same binary the window's process
-/// is running? (Case-insensitive basename comparison.)
+/// Does the desktop entry start the same executable the window's process is
+/// running? Compared by resolved program, not basename: a wrapper and the
+/// binary it execs usually share a name, so a basename check would treat the
+/// inner binary as an agreement and record a launch that bypasses the wrapper.
 fn exec_agrees_with_process(entry: &Entry, argv: &[String], exe: Option<&str>) -> bool {
     let Some(exec) = &entry.exec else {
         return true;
@@ -463,14 +469,18 @@ fn exec_agrees_with_process(entry: &Entry, argv: &[String], exe: Option<&str>) -
     let Some(first) = exec_argv.first() else {
         return true;
     };
-    let first_l = util::basename(first).to_lowercase();
+    // An `Exec` we cannot resolve is not a trustworthy replacement for the
+    // command line we actually observed.
+    if desktop::resolve_program(first).is_none() {
+        return true;
+    }
     if let Some(exe) = exe {
-        if util::basename(exe).to_lowercase() == first_l {
+        if desktop::same_program(exe, first) {
             return true;
         }
     }
     if let Some(a0) = argv.first() {
-        if util::basename(a0).to_lowercase() == first_l {
+        if desktop::same_program(a0, first) {
             return true;
         }
     }
@@ -732,6 +742,81 @@ mod tests {
         assert_eq!(record.tile, Some(1));
         assert!(!record.focused);
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn wrapper_launch_prefers_desktop_entry_exec() {
+        // Simulate Nix's Chromium: the desktop entry starts `…/bin/chromium`,
+        // a wrapper script that execs `…/libexec/chromium/chromium`.
+        let dir = std::env::temp_dir().join(format!("niri-resume-wrapper-{}", std::process::id()));
+        let wrapper = dir.join("bin").join("chromium");
+        let inner = dir.join("libexec").join("chromium").join("chromium");
+        for path in [&wrapper, &inner] {
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, "#!/bin/sh\n").unwrap();
+            std::fs::set_permissions(path, std::os::unix::fs::PermissionsExt::from_mode(0o755))
+                .unwrap();
+        }
+
+        let proc = ProcInfo {
+            exe: Some(inner.to_string_lossy().into_owned()),
+            argv: vec![inner.to_string_lossy().into_owned()],
+            cwd: Some("/tmp".into()),
+        };
+        let entry = Entry {
+            id: "chromium-browser".into(),
+            exec: Some(format!("{} %U", wrapper.display())),
+            ..Entry::default()
+        };
+
+        let launch = instance(Some(&proc), Some(&entry)).expect("launch");
+        assert_eq!(launch.argv, vec![wrapper.to_string_lossy().into_owned()]);
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn same_program_keeps_exact_process_argv() {
+        let dir = std::env::temp_dir().join(format!("niri-resume-sameprog-{}", std::process::id()));
+        let app = dir.join("app");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(&app, "#!/bin/sh\n").unwrap();
+        std::fs::set_permissions(&app, std::os::unix::fs::PermissionsExt::from_mode(0o755))
+            .unwrap();
+
+        let app_s = app.to_string_lossy().into_owned();
+        let proc = ProcInfo {
+            exe: Some(app_s.clone()),
+            argv: vec![app_s.clone(), "--profile".into(), "work".into()],
+            cwd: Some("/tmp".into()),
+        };
+        let entry = Entry {
+            id: "app".into(),
+            exec: Some(format!("{app_s} %u")),
+            ..Entry::default()
+        };
+
+        let launch = instance(Some(&proc), Some(&entry)).expect("launch");
+        assert_eq!(launch.argv, vec![app_s, "--profile".into(), "work".into()]);
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn missing_exec_program_keeps_process_argv() {
+        let proc = ProcInfo {
+            exe: Some("/definitely/not/here/app".into()),
+            argv: vec!["/definitely/not/here/app".into()],
+            cwd: None,
+        };
+        let entry = Entry {
+            id: "app".into(),
+            exec: Some("/definitely/not/here/other %u".into()),
+            ..Entry::default()
+        };
+
+        let launch = instance(Some(&proc), Some(&entry)).expect("launch");
+        assert_eq!(launch.argv, vec!["/definitely/not/here/app"]);
     }
 
     fn set(items: &[&str]) -> HashSet<String> {
